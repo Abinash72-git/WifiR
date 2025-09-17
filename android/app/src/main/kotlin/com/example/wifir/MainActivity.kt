@@ -43,6 +43,8 @@ class MainActivity : FlutterActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var disconnectCheckRunnable: Runnable? = null
 
+    private var isManualDisconnectRequested = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -117,7 +119,19 @@ class MainActivity : FlutterActivity() {
 
                         networkCallback = object : ConnectivityManager.NetworkCallback() {
                             override fun onAvailable(network: Network) {
+                                // Force app traffic to use this Wi-Fi
                                 connectivityManager?.bindProcessToNetwork(network)
+
+                                // Some devices need this older API to keep the connection alive
+                                try {
+                                    @Suppress("DEPRECATION")
+                                    ConnectivityManager::class.java
+                                        .getMethod("setProcessDefaultNetwork", Network::class.java)
+                                        .invoke(connectivityManager, network)
+                                } catch (e: Exception) {
+                                    Log.w("MainActivity", "setProcessDefaultNetwork not available: ${e.message}")
+                                }
+
                                 result.success(true)
 
                                 lastConnectedSSID = ssid
@@ -137,6 +151,7 @@ class MainActivity : FlutterActivity() {
                             }
                         }
 
+
                         connectivityManager?.requestNetwork(request, networkCallback!!)
                     } else {
                         result.success(false)
@@ -146,28 +161,26 @@ class MainActivity : FlutterActivity() {
                 "disconnectWifi" -> {
                     try {
                         val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-
+                        
                         val currentSSID = getCurrentSSID()
                         if (currentSSID.isNotEmpty()) {
                             lastConnectedSSID = currentSSID
                         }
-
+                        
+                        // Set the flag to indicate manual disconnection
                         isManualDisconnectRequested = true
-
+                        
                         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                             wifiManager.disconnect()
-                            startDisconnectMonitoring()
                             result.success(true)
                         } else {
                             val intent = Intent(Settings.ACTION_WIFI_SETTINGS)
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             startActivity(intent)
                             connectivityManager?.bindProcessToNetwork(null)
-
-                            startDisconnectMonitoring()
                             result.success(false)
                         }
-
+                        
                         networkCallback?.let {
                             connectivityManager?.unregisterNetworkCallback(it)
                         }
@@ -273,21 +286,31 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun handleWifiDisconnection() {
-        if (isConnected && !lastConnectedSSID.isNullOrEmpty()) {
-            Log.d("WiFiDisconnect", "Handling disconnection for: $lastConnectedSSID")
+    // Inside MainActivity.kt - modify the handleWifiDisconnection() method
+            private fun handleWifiDisconnection() {
+                if (isConnected && !lastConnectedSSID.isNullOrEmpty()) {
+                    Log.d("WiFiDisconnect", "Handling disconnection for: $lastConnectedSSID")
 
-            val serviceIntent = Intent(this, WifiForegroundService::class.java)
-            serviceIntent.putExtra("ssid", lastConnectedSSID)
-            serviceIntent.putExtra("status", "Disconnected")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
+                    val serviceIntent = Intent(this, WifiForegroundService::class.java)
+                    serviceIntent.putExtra("ssid", lastConnectedSSID)
+                    serviceIntent.putExtra("status", "Disconnected")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent)
+                    }
+                    
+                    // Pass the disconnect type to Flutter
+                    wifiChannel?.invokeMethod("wifiDisconnected", 
+                        mapOf(
+                            "ssid" to lastConnectedSSID,
+                            "isManual" to isManualDisconnectRequested
+                        )
+                    )
+                    
+                    isConnected = false
+                    lastConnectedSSID = null
+                    isManualDisconnectRequested = false
+                }
             }
-
-            isConnected = false
-            lastConnectedSSID = null
-        }
-    }
 
     private fun registerWifiReceiver() {
         val filter = IntentFilter()
@@ -338,6 +361,13 @@ class MainActivity : FlutterActivity() {
 
         registerReceiver(wifiReceiver, filter)
     }
+
+            override fun onLost(network: Network) {
+            super.onLost(network)
+            if (!isManualDisconnectRequested) {
+                handleWifiDisconnection()
+            }
+        }
 
     override fun onResume() {
         super.onResume()

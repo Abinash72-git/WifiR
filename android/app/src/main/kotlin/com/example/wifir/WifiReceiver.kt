@@ -114,34 +114,32 @@ class WifiReceiver : BroadcastReceiver() {
     }
 }
 
-private fun handleWifiDisconnected(context: Context) {
-    try {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val lastConnectedSSID = prefs.getString(LAST_CONNECTED_SSID, "")
+                    private fun handleWifiDisconnected(context: Context, isManual: Boolean = false) {
+                        try {
+                            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            val lastConnectedSSID = prefs.getString(LAST_CONNECTED_SSID, "")
+                            
+                            if (!lastConnectedSSID.isNullOrEmpty()) {
+                                // Store disconnect time for break calculation
+                                val now = System.currentTimeMillis()
+                                prefs.edit().putLong(LAST_DISCONNECT_TIME, now).apply()
+                                
+                                Log.d("WifiReceiver", "Wi-Fi disconnected from: $lastConnectedSSID (${if (isManual) "Manual" else "Auto"})")
 
-        if (!lastConnectedSSID.isNullOrEmpty()) {
-            val now = System.currentTimeMillis()
+                                // Save disconnect event into history with proper type
+                                val status = if (isManual) "Disconnected (Manual)" else "Disconnected (Auto)"
+                                saveWifiEvent(context, lastConnectedSSID, status, now)
 
-            // Save the disconnect event into history ✅
-            saveWifiEvent(context, lastConnectedSSID, "Disconnected (Auto)", now)
-
-            // Show notification
-            showWifiNotification(context, lastConnectedSSID, "Disconnected")
-
-            // Clear last connected SSID
-            prefs.edit().putString(LAST_CONNECTED_SSID, "").apply()
-
-            // Notify Flutter app about disconnection
-            notifyFlutterAppDisconnect(context, lastConnectedSSID)
-
-            android.util.Log.d("WifiReceiver", "📴 Wi-Fi auto-disconnected from: $lastConnectedSSID at $now")
-        }
-    } catch (e: Exception) {
-        android.util.Log.e("WifiReceiver", "⚠️ Error handling auto Wi-Fi disconnection: ${e.message}")
-    }
-}
-
-
+                                // Show notification
+                                showWifiNotification(context, lastConnectedSSID, "Disconnected")
+                                
+                                // Notify Flutter app about disconnection with type
+                                notifyFlutterAppDisconnect(context, lastConnectedSSID, isManual)
+                            }
+                        } catch (e: Exception) {
+                            Log.e("WifiReceiver", "Error handling Wi-Fi disconnection: ${e.message}")
+                        }
+                    }
 
     private fun isValidSSID(ssid: String?): Boolean {
         return !ssid.isNullOrEmpty() && ssid != "<unknown ssid>" && ssid != "0x" && ssid.trim().isNotEmpty()
@@ -204,15 +202,16 @@ private fun handleWifiDisconnected(context: Context) {
         }
     }
 
-    private fun notifyFlutterAppDisconnect(context: Context, ssid: String) {
-        try {
-            val intent = Intent("com.tabsquare.wifir.WIFI_DISCONNECTED")
-            intent.putExtra("ssid", ssid)
-            context.sendBroadcast(intent)
-        } catch (e: Exception) {
-            Log.e("WifiReceiver", "Error notifying Flutter app about disconnect: ${e.message}")
+        private fun notifyFlutterAppDisconnect(context: Context, ssid: String, isManual: Boolean) {
+            try {
+                val intent = Intent("com.tabsquare.wifir.WIFI_DISCONNECTED")
+                intent.putExtra("ssid", ssid)
+                intent.putExtra("isManual", isManual)
+                context.sendBroadcast(intent)
+            } catch (e: Exception) {
+                Log.e("WifiReceiver", "Error notifying Flutter app about disconnect: ${e.message}")
+            }
         }
-    }
 
     private fun notifyFlutterAppBreak(context: Context, minutes: Int, label: String) {
         try {
@@ -225,33 +224,35 @@ private fun handleWifiDisconnected(context: Context) {
         }
     }
 
-    private fun saveWifiEvent(context: Context, ssid: String, status: String, eventTime: Long) {
-        try {
-            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val historyJson = prefs.getString("history", "[]")
-            val historyArray = JSONArray(historyJson ?: "[]")
+        // ✅ Now public & reusable
+        fun saveWifiEvent(context: Context, ssid: String, status: String, eventTime: Long) {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val historyJson = prefs.getString("history", "[]")
+                val historyArray = JSONArray(historyJson ?: "[]")
 
-            val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.getDefault())
-    .format(Date(eventTime))
+                val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.getDefault())
+                    .format(Date(eventTime))
 
-            val event = JSONObject().apply {
-                put("ssid", ssid)
-                put("status", status)
-                put("timestamp", timestamp)
-            }
-
-            historyArray.put(event)
-
-            val trimmedArray = JSONArray().apply {
-                for (i in maxOf(0, historyArray.length() - 100) until historyArray.length()) {
-                    put(historyArray.get(i))
+                val event = JSONObject().apply {
+                    put("ssid", ssid)
+                    put("status", status)
+                    put("timestamp", timestamp)
                 }
-            }
 
-            prefs.edit().putString("history", trimmedArray.toString()).apply()
-            Log.d("WifiReceiver", "Saved Wi-Fi event: $ssid - $status")
-        } catch (e: Exception) {
-            Log.e("WifiReceiver", "Error saving Wi-Fi event: ${e.message}")
+                historyArray.put(event)
+
+                val trimmedArray = JSONArray().apply {
+                    for (i in maxOf(0, historyArray.length() - 100) until historyArray.length()) {
+                        put(historyArray.get(i))
+                    }
+                }
+
+                prefs.edit().putString("history", trimmedArray.toString()).apply()
+                Log.d("WifiReceiver", "Saved Wi-Fi event: $ssid - $status")
+            } catch (e: Exception) {
+                Log.e("WifiReceiver", "Error saving Wi-Fi event: ${e.message}")
+            }
         }
-    }
+    
 }

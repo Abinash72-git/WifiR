@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wifir/homepage.dart';
 import 'package:wifir/loginpage.dart';
+import 'package:wifir/main.dart';
 import 'package:wifir/util/appconstants.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -16,8 +18,12 @@ class _SplashScreenState extends State<SplashScreen> {
   void initState() {
     super.initState();
     // Navigate after first frame to avoid context issues
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _navigate();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final status = await Permission.notification.status;
+      if (!status.isGranted) {
+        await openUnusedAppsSettings(); // only if needed
+      }
+      await _navigate();
     });
   }
 
@@ -74,7 +80,7 @@ class _SplashScreenState extends State<SplashScreen> {
             ),
             SizedBox(height: 20),
             Image(
-              image: AssetImage("assets/wifir_launcher.png"),
+              image: AssetImage("assets/Empl.png"),
               width: 100,
               height: 100,
               fit: BoxFit.contain,

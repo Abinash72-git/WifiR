@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:developer';
 import 'dart:io';
 
@@ -7,12 +9,17 @@ import 'package:fluttertoast/fluttertoast.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/timezone.dart' as tz;
 import 'package:wifi_scan/wifi_scan.dart';
 import 'package:wifi_iot/wifi_iot.dart';
 
 import 'package:wifir/historypage.dart';
 import 'package:wifir/model/wifihistory.dart';
 import 'package:wifir/util/appconstants.dart';
+
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+import 'package:workmanager/workmanager.dart';
 
 class Homepage extends StatefulWidget {
   const Homepage({super.key});
@@ -21,25 +28,391 @@ class Homepage extends StatefulWidget {
   State<Homepage> createState() => _HomepageState();
 }
 
-class _HomepageState extends State<Homepage> {
+class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
   static const platform = MethodChannel("wifi.connect.channel");
 
   final List<WiFiAccessPoint> wifiList = [];
   final List<WifiHistory> wifiHistory = [];
+  final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
 
   bool isScanning = false;
   bool isConnecting = false;
   bool _permissionsChecked = false;
   bool _dialogOpen = false;
 
+  String? _lastNotifiedSSID;
+  DateTime? _lastNotificationTime;
+
+  Timer? _connectionMonitor;
+
   String? connectedSSID;
   String? connectingSSID;
+
+  String? _lastConnectedSSID;
+  bool _wasConnected = false;
+  DateTime? _disconnectionTime;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeNotifications();
     _initializeApp();
     _markUserRegistered();
+    loadWifiHistory();
+    _loadWifiHistoryFromPrefs();
+
+    // Initialize connection state before registering break receiver
+    _initConnectionState().then((_) {
+      _registerBreakReceiver();
+    });
+
+    platform.setMethodCallHandler(_handleNativeMethodCalls);
+    _startConnectionMonitor();
+  }
+
+  Future<void> _initConnectionState() async {
+    try {
+      final ssid = await WiFiForIoTPlugin.getSSID();
+      _wasConnected =
+          ssid != null &&
+          ssid.isNotEmpty &&
+          ssid != "<unknown ssid>" &&
+          ssid != "0x";
+      _lastConnectedSSID = ssid;
+      print(
+        "📡 Initial connection state: ${_wasConnected ? 'Connected to $_lastConnectedSSID' : 'Disconnected'}",
+      );
+    } catch (e) {
+      print("❌ Error initializing connection state: $e");
+      _wasConnected = false;
+      _lastConnectedSSID = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _connectionMonitor?.cancel(); // stop timer
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkCurrentConnection();
+    }
+  }
+
+  // void _registerBreakReceiver() {
+  //   const reconnectBroadcast = "com.tabsquare.wifir.RECONNECT_DURATION";
+  //   final reconnectStream = EventChannel(reconnectBroadcast);
+
+  //   reconnectStream.receiveBroadcastStream().listen(
+  //     (event) {
+  //       // Handle different event formats
+  //       int minutes = 0;
+
+  //       if (event is int) {
+  //         // Direct integer value
+  //         minutes = event;
+  //       } else if (event is Map) {
+  //         // Map with 'duration' key
+  //         final durationRaw = event['duration'];
+  //         minutes = durationRaw is int
+  //             ? durationRaw
+  //             : int.tryParse(durationRaw.toString()) ?? 0;
+  //       } else if (event is String) {
+  //         // String representation of number
+  //         minutes = int.tryParse(event) ?? 0;
+  //       } else {
+  //         // Fallback - try to convert to string then parse
+  //         minutes = int.tryParse(event.toString()) ?? 0;
+  //       }
+
+  //       String label = "Unknown Break";
+
+  //       if (minutes < 1) {
+  //         label = "Short Break ($minutes min)";
+  //       } else if (minutes < 30) {
+  //         label = "Tea Break ($minutes min)";
+  //       } else {
+  //         label = "Lunch Break ($minutes min)";
+  //       }
+
+  //       print("📡 $label");
+  //       if (mounted) {
+  //         ScaffoldMessenger.of(
+  //           context,
+  //         ).showSnackBar(SnackBar(content: Text("Break Detected: $label")));
+  //       }
+  //     },
+  //     onError: (error) {
+  //       print("❌ Error in break receiver: $error");
+  //     },
+  //   );
+  // }
+
+  void _registerBreakReceiver() {
+    const reconnectBroadcast = "com.tabsquare.wifir.RECONNECT_DURATION";
+    final reconnectStream = EventChannel(reconnectBroadcast);
+
+    reconnectStream.receiveBroadcastStream().listen(
+      (event) async {
+        final currentSSID = await WiFiForIoTPlugin.getSSID();
+        final isConnected =
+            currentSSID != null &&
+            currentSSID.isNotEmpty &&
+            currentSSID != "<unknown ssid>" &&
+            currentSSID != "0x";
+
+        if (_wasConnected && !isConnected) {
+          _disconnectionTime = DateTime.now();
+          print("📡 Disconnected at: $_disconnectionTime");
+        } else if (!_wasConnected &&
+            isConnected &&
+            _disconnectionTime != null) {
+          final now = DateTime.now();
+          final breakDuration = now.difference(_disconnectionTime!);
+          final minutes = breakDuration.inMinutes;
+
+          String label;
+          if (minutes < 1) {
+            label = "Short Break ($minutes min)";
+          } else if (minutes < 30) {
+            label = "Tea Break ($minutes min)";
+          } else {
+            label = "Lunch Break ($minutes min)";
+          }
+
+          print("📡 $label - Reconnected to: $currentSSID");
+
+          // ✅ NEW: show notification instead of only snackbar
+          await _showBreakNotification(currentSSID!, label);
+
+          // if (mounted) {
+          //   ScaffoldMessenger.of(
+          //     context,
+          //   ).showSnackBar(SnackBar(content: Text("Break Detected: $label")));
+          // }
+
+          _disconnectionTime = null;
+        }
+
+        _wasConnected = isConnected;
+        _lastConnectedSSID = currentSSID;
+      },
+      onError: (error) {
+        print("❌ Error in break receiver: $error");
+      },
+    );
+  }
+
+  Future<void> _showBreakNotification(String ssid, String label) async {
+    const androidDetails = AndroidNotificationDetails(
+      'wifi_channel',
+      'Wi-Fi Notifications',
+      channelDescription: 'Notifies when Wi-Fi breaks are detected',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+
+    const notifDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'Wi-Fi Break Detected',
+      '$label on $ssid',
+      notifDetails,
+    );
+  }
+
+  void _startConnectionMonitor() {
+    _connectionMonitor = Timer.periodic(const Duration(seconds: 5), (_) async {
+      try {
+        final ssid = await WiFiForIoTPlugin.getSSID();
+
+        if (ssid == null ||
+            ssid.isEmpty ||
+            ssid == "<unknown ssid>" ||
+            ssid == "0x") {
+          // means disconnected
+          if (connectedSSID != null) {
+            final prev = connectedSSID!;
+            print("⚠️ Lost connection to $prev (monitor)");
+            // ❌ don't save history here, native will handle it
+            setState(() => connectedSSID = null);
+            await _notifications.cancel(1);
+          }
+        } else {
+          // means connected
+          if (connectedSSID != ssid) {
+            print("✅ Auto-detected connection to $ssid");
+            // ❌ don't save history here, native will handle it
+            setState(() => connectedSSID = ssid);
+            await _scheduleReminderNotification(ssid);
+          }
+        }
+      } catch (e) {
+        print("❌ Monitor error: $e");
+      }
+    });
+  }
+
+  // Future<dynamic> _handleNativeMethodCalls(MethodCall call) async {
+  //   if (call.method == "wifiConnected") {
+  //     final ssid = call.arguments as String;
+  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
+  //       print("📡 Auto Wi-Fi connected: $ssid");
+  //       _saveWifiHistory(ssid, "Connected (Auto)");
+  //       if (mounted) {
+  //         setState(() => connectedSSID = ssid);
+  //       }
+  //       await _showWifiNotification(ssid);
+  //       await _scheduleReminderNotification(ssid);
+  //     }
+  //   } else if (call.method == "wifiDisconnected") {
+  //     final ssid = call.arguments as String;
+  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
+  //       print("📡 Auto Wi-Fi disconnected: $ssid");
+  //       _saveWifiHistory(ssid, "Disconnected (Auto)");
+  //       if (mounted) {
+  //         setState(() => connectedSSID = null);
+  //       }
+  //       await _showDisconnectedNotification(ssid);
+  //       // Cancel any pending reminder notifications
+  //       await _notifications.cancel(1);
+  //     }
+  //   }
+  // }
+
+  Future<dynamic> _handleNativeMethodCalls(MethodCall call) async {
+    if (call.method == "wifiConnected") {
+      final ssid = call.arguments as String;
+      if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
+        print("📡 Auto Wi-Fi connected: $ssid");
+        _saveWifiHistory(ssid, "Connected (Auto)");
+        if (mounted) {
+          setState(() => connectedSSID = ssid);
+        }
+        await _showWifiNotification(ssid);
+        await _scheduleReminderNotification(ssid);
+      }
+    } else if (call.method == "wifiDisconnected") {
+      final ssid = call.arguments as String;
+      if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
+        print("📡 Wi-Fi disconnected: $ssid");
+        _saveWifiHistory(ssid, "Disconnected"); // Make sure this is called
+        if (mounted) {
+          setState(() => connectedSSID = null);
+        }
+        //await _showDisconnectedNotification(ssid);
+        await _notifications.cancel(1);
+      }
+    }
+  }
+
+  Future<void> _initializeNotifications() async {
+    const AndroidInitializationSettings androidInit =
+        AndroidInitializationSettings('@mipmap/wifir_launcher');
+    const InitializationSettings initSettings = InitializationSettings(
+      android: androidInit,
+    );
+
+    await _notifications.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        if (response.payload != null) {
+          debugPrint("Notification tapped: ${response.payload}");
+        }
+      },
+    );
+
+    // Create channel
+    const AndroidNotificationChannel channel = AndroidNotificationChannel(
+      'wifi_channel',
+      'Wi-Fi Notifications',
+      description: 'Notifies when Wi-Fi is connected',
+      importance: Importance.max,
+    );
+
+    final androidImpl = _notifications
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    await androidImpl?.createNotificationChannel(channel);
+  }
+
+  Future<void> _showWifiNotification(String ssid) async {
+    // Prevent spam: same SSID within 10 seconds = skip
+    if (_lastNotifiedSSID == ssid &&
+        _lastNotificationTime != null &&
+        DateTime.now().difference(_lastNotificationTime!).inSeconds < 10) {
+      print("⏭ Skipping duplicate notification for $ssid");
+      return;
+    }
+
+    _lastNotifiedSSID = ssid;
+    _lastNotificationTime = DateTime.now();
+
+    const androidDetails = AndroidNotificationDetails(
+      'wifi_channel',
+      'Wi-Fi Notifications',
+      channelDescription: 'Notifies when Wi-Fi is connected',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+
+    const notifDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'Wi-Fi Connected',
+      'Login to: $ssid',
+      notifDetails,
+    );
+  }
+
+  // Future<void> _showDisconnectedNotification(String ssid) async {
+  //   const androidDetails = AndroidNotificationDetails(
+  //     'wifi_channel',
+  //     'Wi-Fi Notifications',
+  //     channelDescription: 'Notifies when Wi-Fi is disconnected',
+  //     importance: Importance.max,
+  //     priority: Priority.high,
+  //   );
+
+  //   const notifDetails = NotificationDetails(android: androidDetails);
+
+  //   await _notifications.show(
+  //     DateTime.now().millisecondsSinceEpoch ~/ 1000,
+  //     'Wi-Fi Disconnected',
+  //     'Logout from: $ssid',
+  //     notifDetails,
+  //   );
+  // }
+
+  Future<void> _scheduleReminderNotification(String ssid) async {
+    const androidDetails = AndroidNotificationDetails(
+      'wifi_channel',
+      'Wi-Fi Notifications',
+      channelDescription: 'Notifies when Wi-Fi is connected',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+
+    const notifDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.zonedSchedule(
+      1, // notification id
+      'Wi-Fi Reminder',
+      'Still connected to: $ssid',
+      tz.TZDateTime.now(tz.local).add(const Duration(minutes: 15)),
+      notifDetails,
+      androidScheduleMode: AndroidScheduleMode.inexact,
+      payload: ssid,
+    );
   }
 
   Future<void> _markUserRegistered() async {
@@ -48,10 +421,13 @@ class _HomepageState extends State<Homepage> {
 
     final value = prefs.getBool(AppConstants.register);
     log("is_registered = $value");
+    print("✅ User registration status saved: $value");
   }
 
   Future<void> _initializeApp() async {
+    print("🚀 Initializing App...");
     final ready = await _checkAndRequestPermissions();
+    print("📌 Permissions status: $ready");
     if (!ready) return;
 
     final wifiOk = await _ensureWifiEnabled();
@@ -59,9 +435,11 @@ class _HomepageState extends State<Homepage> {
 
     await _checkCurrentConnection();
     await _scanWifi();
+    print("✅ App initialization completed!");
   }
 
   List<WiFiAccessPoint> _prioritizeConnected(List<WiFiAccessPoint> items) {
+    print("📶 Sorting Wi-Fi list, total: ${items.length}");
     // Sort by signal strength first
     items.sort((a, b) => b.level.compareTo(a.level));
 
@@ -78,6 +456,7 @@ class _HomepageState extends State<Homepage> {
         others.add(ap);
       }
     }
+    print("🔄 Connected SSID moved to top: $ssid");
     return [...connected, ...others];
   }
 
@@ -135,22 +514,57 @@ class _HomepageState extends State<Homepage> {
     }
   }
 
-  Future<bool> _checkAndRequestPermissions() async {
-    if (_permissionsChecked) return true;
+  Future<void> loadWifiHistory() async {
+    const platform = MethodChannel("wifi.history.channel");
+    try {
+      final String historyJson = await platform.invokeMethod("getWifiHistory");
+      final List<dynamic> historyList = jsonDecode(
+        historyJson.isNotEmpty ? historyJson : "[]",
+      );
+      print("📜 Loaded Wi-Fi History: ${historyList.length} records");
+      if (mounted) {
+        setState(() {
+          wifiHistory.clear();
+          wifiHistory.addAll(
+            historyList.map(
+              (e) => WifiHistory(
+                ssid: e["ssid"],
+                status: e["status"],
+                timestamp: DateTime.parse(e["timestamp"]),
+              ),
+            ),
+          );
+        });
+      }
+    } on PlatformException catch (e) {
+      log("Failed to load Wi-Fi history: ${e.message}");
+      print("❌ Failed to load Wi-Fi history: ${e.message}");
+    }
+  }
 
-    // 1) Location services
-    final servicesOn = await Geolocator.isLocationServiceEnabled();
-    if (!servicesOn) {
-      await _showLocationServicesDialog();
-      if (!await Geolocator.isLocationServiceEnabled()) return false;
+  Future<bool> _checkAndRequestPermissions() async {
+    if (_permissionsChecked) {
+      print("✅ Permissions already granted");
+      return true;
     }
 
-    // 2) Runtime permissions
+    print("🔍 Checking permissions...");
+    final servicesOn = await Geolocator.isLocationServiceEnabled();
+    if (!servicesOn) {
+      print("⚠️ Location services OFF! Requesting user to enable...");
+      await _showLocationServicesDialog();
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        print("❌ Location services still disabled!");
+        return false;
+      }
+    }
+
     if (Platform.isAndroid) {
       final statuses = await [
         Permission.location,
         Permission.locationWhenInUse,
         Permission.nearbyWifiDevices,
+        Permission.locationAlways,
       ].request();
 
       final granted =
@@ -158,6 +572,7 @@ class _HomepageState extends State<Homepage> {
           (statuses[Permission.location]?.isGranted ?? false) ||
           (statuses[Permission.locationWhenInUse]?.isGranted ?? false);
 
+      print("📌 Permission granted: $granted");
       if (!granted) {
         Fluttertoast.showToast(
           msg: "Location or Nearby Wi-Fi permission is required.",
@@ -166,8 +581,9 @@ class _HomepageState extends State<Homepage> {
       }
     }
 
-    if (!mounted) return true;
-    setState(() => _permissionsChecked = true);
+    if (mounted) {
+      setState(() => _permissionsChecked = true);
+    }
     return true;
   }
 
@@ -205,15 +621,33 @@ class _HomepageState extends State<Homepage> {
     try {
       final ssid = await WiFiForIoTPlugin.getSSID();
       if (!mounted) return;
-      setState(() => connectedSSID = ssid);
+
+      if (ssid != null &&
+          ssid.isNotEmpty &&
+          ssid != "<unknown ssid>" &&
+          ssid != "0x") {
+        setState(() => connectedSSID = ssid);
+        print("📡 Currently connected to: $ssid");
+
+        if (wifiHistory.isEmpty || wifiHistory.last.ssid != ssid) {
+          _saveWifiHistory(ssid, "Login (Auto)");
+        }
+      } else {
+        setState(() => connectedSSID = null);
+      }
     } catch (_) {
-      if (!mounted) return;
-      setState(() => connectedSSID = null);
+      if (mounted) {
+        setState(() => connectedSSID = null);
+      }
     }
   }
 
   Future<void> _scanWifi() async {
-    if (isScanning) return;
+    if (isScanning) {
+      print("⏳ Scan already in progress, skipping...");
+      return;
+    }
+
     if (!await _checkAndRequestPermissions()) return;
 
     final wifiOk = await _ensureWifiEnabled();
@@ -223,40 +657,47 @@ class _HomepageState extends State<Homepage> {
     setState(() => isScanning = true);
 
     final started = DateTime.now();
+    print("🔍 Starting Wi-Fi Scan...");
 
-    // do the real scan
-    Future<void> doScan() async {
+    try {
+      // do the real scan
       final canScan = await WiFiScan.instance.canStartScan();
       if (canScan == CanStartScan.yes) {
         await WiFiScan.instance.startScan();
         final results = await WiFiScan.instance.getScannedResults();
-        if (!mounted) return;
-        final ordered = _prioritizeConnected(
-          List<WiFiAccessPoint>.from(results),
-        );
-        setState(() {
-          wifiList
-            ..clear()
-            ..addAll(ordered);
-        });
+        print("📡 Found Wi-Fi Networks: ${results.length}");
+        if (mounted) {
+          final ordered = _prioritizeConnected(
+            List<WiFiAccessPoint>.from(results),
+          );
+          setState(() {
+            wifiList
+              ..clear()
+              ..addAll(ordered);
+          });
+        }
       } else {
+        print("❌ Cannot start Wi-Fi scan, permissions issue!");
         Fluttertoast.showToast(
           msg: "Cannot start Wi-Fi scan. Check permissions.",
         );
       }
+    } catch (e) {
+      print("❌ Wi-Fi scan error: $e");
+      Fluttertoast.showToast(msg: "Scan failed: $e");
     }
-
-    await doScan();
 
     // enforce at least 3 seconds of loading
     final elapsed = DateTime.now().difference(started);
-    final remain = Duration(seconds: 3) - elapsed;
+    final remain = const Duration(seconds: 3) - elapsed;
     if (remain.inMilliseconds > 0) {
       await Future.delayed(remain);
     }
 
-    if (!mounted) return;
-    setState(() => isScanning = false);
+    if (mounted) {
+      setState(() => isScanning = false);
+    }
+    print("✅ Wi-Fi Scan Completed!");
   }
 
   void _saveWifiHistory(String ssid, String status) {
@@ -266,6 +707,51 @@ class _HomepageState extends State<Homepage> {
         WifiHistory(ssid: ssid, status: status, timestamp: DateTime.now()),
       );
     });
+    _persistWifiHistory();
+  }
+
+  Future<void> _persistWifiHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final List<Map<String, dynamic>> historyJson = wifiHistory
+          .map(
+            (h) => {
+              "ssid": h.ssid,
+              "status": h.status,
+              "timestamp": h.timestamp.toIso8601String(),
+            },
+          )
+          .toList();
+      await prefs.setString("wifi_history", jsonEncode(historyJson));
+    } catch (e) {
+      print("❌ Failed to persist Wi-Fi history: $e");
+    }
+  }
+
+  Future<void> _loadWifiHistoryFromPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final data = prefs.getString("wifi_history");
+      if (data == null) return;
+
+      final List<dynamic> decoded = jsonDecode(data);
+      if (mounted) {
+        setState(() {
+          wifiHistory.clear();
+          wifiHistory.addAll(
+            decoded.map(
+              (e) => WifiHistory(
+                ssid: e["ssid"],
+                status: e["status"],
+                timestamp: DateTime.parse(e["timestamp"]),
+              ),
+            ),
+          );
+        });
+      }
+    } catch (e) {
+      print("❌ Failed to load Wi-Fi history from preferences: $e");
+    }
   }
 
   Future<void> connectToWifi(String ssid, String password) async {
@@ -274,6 +760,8 @@ class _HomepageState extends State<Homepage> {
       isConnecting = true;
       connectingSSID = ssid;
     });
+
+    print("🔗 Connecting to Wi-Fi: $ssid");
 
     try {
       final bool result = await platform.invokeMethod("connectToWifi", {
@@ -289,7 +777,14 @@ class _HomepageState extends State<Homepage> {
           connectingSSID = null;
         });
         _saveWifiHistory(ssid, "Connected");
+        print("✅ Connected to $ssid");
         Fluttertoast.showToast(msg: "Connected to $ssid");
+
+        // Show local notification
+        await _showWifiNotification(ssid);
+
+        // Place the reminder scheduling here
+        await _scheduleReminderNotification(ssid);
 
         // Automatically move the connected network to top
         _moveConnectedToTop();
@@ -299,6 +794,7 @@ class _HomepageState extends State<Homepage> {
           connectingSSID = null;
         });
         _saveWifiHistory(ssid, "Connection Failed");
+        print("❌ Failed to connect to $ssid");
         Fluttertoast.showToast(msg: "Failed to connect to $ssid");
       }
     } catch (e) {
@@ -308,24 +804,40 @@ class _HomepageState extends State<Homepage> {
         connectingSSID = null;
       });
       _saveWifiHistory(ssid, "Connection Error");
+      print("❌ Connection error: $e");
       Fluttertoast.showToast(msg: "Error: $e");
     }
   }
 
   Future<void> _disconnectWifi() async {
     try {
+      final previousSSID = connectedSSID ?? "Unknown Wi-Fi";
       final bool result = await platform.invokeMethod("disconnectWifi");
+
       if (result) {
-        final previousSSID = connectedSSID ?? "Unknown Wi-Fi";
+        // Normal case
         _saveWifiHistory(previousSSID, "Disconnected");
-        if (!mounted) return;
-        setState(() => connectedSSID = null);
+        if (mounted) setState(() => connectedSSID = null);
+
+        print("🔌 Disconnected from $previousSSID");
         Fluttertoast.showToast(msg: "Disconnected from $previousSSID");
 
-        // Re-sort the list after disconnection (removes priority of previously connected network)
+        //await _showDisconnectedNotification(previousSSID);
+        await _notifications.cancel(1);
         _moveConnectedToTop();
+      } else {
+        // Android 10+ fallback
+        Fluttertoast.showToast(
+          msg: "Please manually disconnect from Wi-Fi in settings",
+        );
+        print("⚠️ Manual disconnect required for $previousSSID (Android 10+)");
+
+        // ✅ Still record history here
+        _saveWifiHistory(previousSSID, "Disconnected (Manual)");
+        if (mounted) setState(() => connectedSSID = null);
       }
     } on PlatformException catch (e) {
+      print("❌ Failed to disconnect Wi-Fi: ${e.message}");
       Fluttertoast.showToast(msg: "Failed to disconnect: ${e.message}");
     }
   }
@@ -335,54 +847,64 @@ class _HomepageState extends State<Homepage> {
 
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true, // allows full height scroll
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (_) {
+      builder: (context) {
         return Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Center(
-                child: Icon(Icons.wifi, size: 40, color: Colors.blue),
-              ),
-              const SizedBox(height: 10),
-              Center(
-                child: Text(
-                  wifi.ssid.isNotEmpty ? wifi.ssid : "Unknown Wi-Fi",
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
+          padding: EdgeInsets.only(
+            left: 20,
+            right: 20,
+            top: 20,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 50,
+            // adds safe space for keyboard & extra padding
+          ),
+          child: SingleChildScrollView(
+            // scrollable content
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Center(
+                  child: Icon(Icons.wifi, size: 40, color: Colors.blue),
+                ),
+                const SizedBox(height: 10),
+                Center(
+                  child: Text(
+                    wifi.ssid.isNotEmpty ? wifi.ssid : "Unknown Wi-Fi",
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 10),
-              Text("BSSID: ${wifi.bssid}"),
-              Text("Signal Strength: ${wifi.level} dBm"),
-              Text("Frequency: ${wifi.frequency} MHz"),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    Navigator.pop(context);
-                    if (isAlreadyConnected) {
-                      _disconnectWifi();
-                    } else {
-                      _showPasswordDialog(wifi);
-                    }
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: isAlreadyConnected
-                        ? Colors.red
-                        : Colors.blue,
+                const SizedBox(height: 10),
+                Text("BSSID: ${wifi.bssid}"),
+                Text("Signal Strength: ${wifi.level} dBm"),
+                Text("Frequency: ${wifi.frequency} MHz"),
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      if (isAlreadyConnected) {
+                        _disconnectWifi();
+                      } else {
+                        _showPasswordDialog(wifi);
+                      }
+                    },
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: isAlreadyConnected
+                          ? Colors.red
+                          : Colors.blue,
+                    ),
+                    child: Text(isAlreadyConnected ? "Disconnect" : "Connect"),
                   ),
-                  child: Text(isAlreadyConnected ? "Disconnect" : "Connect"),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         );
       },
@@ -545,9 +1067,9 @@ class _HomepageState extends State<Homepage> {
                     const SizedBox(height: 8),
                     InkWell(
                       onTap: _scanWifi, // retry scan on tap
-                      child: Row(
+                      child: const Row(
                         mainAxisSize: MainAxisSize.min,
-                        children: const [
+                        children: [
                           Icon(
                             Icons.touch_app, // hand tap icon
                             size: 18,

@@ -17,11 +17,10 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    // Navigate after first frame to avoid context issues
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final status = await Permission.notification.status;
       if (!status.isGranted) {
-        await openUnusedAppsSettings(); // only if needed
+        await openUnusedAppsSettings(); 
       }
       await _navigate();
     });
@@ -29,7 +28,6 @@ class _SplashScreenState extends State<SplashScreen> {
 
   Future<void> _navigate() async {
     try {
-      // show splash for 3s
       await Future.delayed(const Duration(seconds: 3));
 
       final prefs = await SharedPreferences.getInstance();

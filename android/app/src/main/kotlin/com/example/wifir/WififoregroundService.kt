@@ -1,4 +1,3 @@
-
 package com.tabsquare.Wifir
 
 import android.app.Notification
@@ -18,16 +17,16 @@ class WifiForegroundService : Service() {
         createNotificationChannel()
     }
 
-   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val ssid = intent?.getStringExtra("ssid") ?: "Unknown"
-        val status = intent?.getStringExtra("status") ?: "Idle"
+        val status = intent?.getStringExtra("status") ?: "Welcome"
 
         // 🔹 Choose text based on real status
         val (title, text) = when (status) {
-            "Connected" -> "Wi-Fi Connected" to "Login to: $ssid"
-            "Disconnected" -> "Wi-Fi Disconnected" to "Logout from: $ssid"
-            else -> "DTIT" to "Welcome To DTIT"
-        }
+                "Connected" -> "Wi-Fi Connected" to "Login to: $ssid"
+                "Disconnected" -> "Wi-Fi Disconnected" to "Logout from: $ssid"
+                else -> "DTIT" to "Welcome to DTIT"
+            }
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
@@ -42,7 +41,8 @@ class WifiForegroundService : Service() {
 
         return START_STICKY // Keeps service alive if killed
     }
-override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

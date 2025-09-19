@@ -24,6 +24,8 @@ import android.content.SharedPreferences
 import android.util.Log
 import android.os.Handler
 import android.os.Looper
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     private val WIFI_CONNECT_CHANNEL = "wifi.connect.channel"
@@ -43,205 +45,287 @@ class MainActivity : FlutterActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var disconnectCheckRunnable: Runnable? = null
 
-    private var isManualDisconnectRequested = false
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            val serviceIntent = Intent(this, WifiForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
+        // Delay service startup to avoid blocking the app initialization
+        handler.postDelayed({
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    android.Manifest.permission.ACCESS_FINE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                val serviceIntent = Intent(this, WifiForegroundService::class.java)
+                serviceIntent.putExtra("status", "Welcome")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
             } else {
-                startService(serviceIntent)
+                Log.e("MainActivity", "Location permission not granted. Skipping FGS start.")
             }
-        } else {
-            Log.e("MainActivity", "Location permission not granted. Skipping FGS start.")
-        }
+        }, 1000)
     }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        wifiChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_CONNECT_CHANNEL)
+        try {
+            wifiChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_CONNECT_CHANNEL)
 
-        // EventChannel for RECONNECT_DURATION
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, RECONNECT_DURATION_CHANNEL)
-            .setStreamHandler(object : EventChannel.StreamHandler {
-                private var eventSink: EventChannel.EventSink? = null
-                private var handler: Handler? = null
-                private var runnable: Runnable? = null
+            // EventChannel for RECONNECT_DURATION
+            EventChannel(flutterEngine.dartExecutor.binaryMessenger, RECONNECT_DURATION_CHANNEL)
+                .setStreamHandler(object : EventChannel.StreamHandler {
+                    private var eventSink: EventChannel.EventSink? = null
+                    private var handler: Handler? = null
+                    private var runnable: Runnable? = null
 
-                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    eventSink = events
-                    handler = Handler(Looper.getMainLooper())
-                    runnable = object : Runnable {
-                        override fun run() {
-                            eventSink?.success("Some duration data")
-                            handler?.postDelayed(this, 1000)
+                    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                        eventSink = events
+                        handler = Handler(Looper.getMainLooper())
+                        runnable = object : Runnable {
+                            override fun run() {
+                                eventSink?.success("Some duration data")
+                                handler?.postDelayed(this, 1000)
+                            }
                         }
+                        handler?.post(runnable!!)
                     }
-                    handler?.post(runnable!!)
-                }
 
-                override fun onCancel(arguments: Any?) {
-                    eventSink = null
-                    handler?.removeCallbacks(runnable!!)
-                }
-            })
+                    override fun onCancel(arguments: Any?) {
+                        eventSink = null
+                        handler?.removeCallbacks(runnable!!)
+                    }
+                })
 
-        wifiChannel!!.setMethodCallHandler { call, result ->
-            when (call.method) {
-                "connectToWifi" -> {
-                    val ssid = call.argument<String>("ssid") ?: ""
-                    val password = call.argument<String>("password") ?: ""
+            wifiChannel!!.setMethodCallHandler { call, result ->
+                try {
+                    when (call.method) {
+                        "connectToWifi" -> {
+                            val ssid = call.argument<String>("ssid") ?: ""
+                            val password = call.argument<String>("password") ?: ""
 
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        val specifier = android.net.wifi.WifiNetworkSpecifier.Builder()
-                            .setSsid(ssid)
-                            .setWpa2Passphrase(password)
-                            .build()
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                val specifier = android.net.wifi.WifiNetworkSpecifier.Builder()
+                                    .setSsid(ssid)
+                                    .setWpa2Passphrase(password)
+                                    .build()
 
-                        val request = NetworkRequest.Builder()
-                            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                            .setNetworkSpecifier(specifier)
-                            .build()
+                                val request = NetworkRequest.Builder()
+                                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                                    .setNetworkSpecifier(specifier)
+                                    .build()
 
-                        connectivityManager = getSystemService(ConnectivityManager::class.java)
+                                connectivityManager = getSystemService(ConnectivityManager::class.java)
 
-                        networkCallback?.let {
-                            connectivityManager?.unregisterNetworkCallback(it)
-                        }
-
-                        networkCallback = object : ConnectivityManager.NetworkCallback() {
-                            override fun onAvailable(network: Network) {
-                                // Force app traffic to use this Wi-Fi
-                                connectivityManager?.bindProcessToNetwork(network)
-
-                                // Some devices need this older API to keep the connection alive
-                                try {
-                                    @Suppress("DEPRECATION")
-                                    ConnectivityManager::class.java
-                                        .getMethod("setProcessDefaultNetwork", Network::class.java)
-                                        .invoke(connectivityManager, network)
-                                } catch (e: Exception) {
-                                    Log.w("MainActivity", "setProcessDefaultNetwork not available: ${e.message}")
+                                networkCallback?.let {
+                                    connectivityManager?.unregisterNetworkCallback(it)
                                 }
 
-                                result.success(true)
+                                networkCallback = object : ConnectivityManager.NetworkCallback() {
+                                    override fun onAvailable(network: Network) {
+                                        connectivityManager?.bindProcessToNetwork(network)
+                                        result.success(true)
 
-                                lastConnectedSSID = ssid
-                                isConnected = true
-                                isManualDisconnectRequested = false
-                            }
+                                        lastConnectedSSID = ssid
+                                        isConnected = true
+                                        isManualDisconnectRequested = false
+                                        
+                                        // Save connection to history
+                                        handler.post {
+                                            saveWifiEvent(ssid, "Connected")
+                                        }
+                                    }
 
-                            override fun onUnavailable() {
+                                    override fun onUnavailable() {
+                                        result.success(false)
+                                    }
+
+                                    override fun onLost(network: Network) {
+                                        super.onLost(network)
+                                        if (!isManualDisconnectRequested) {
+                                            handler.post {
+                                                handleWifiDisconnection()
+                                            }
+                                        }
+                                    }
+                                }
+
+                                connectivityManager?.requestNetwork(request, networkCallback!!)
+                            } else {
                                 result.success(false)
                             }
+                        }
 
-                            override fun onLost(network: Network) {
-                                super.onLost(network)
-                                if (!isManualDisconnectRequested) {
-                                    handleWifiDisconnection()
+                        "disconnectWifi" -> {
+                            try {
+                                val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+
+                                val currentSSID = getCurrentSSID()
+                                if (currentSSID.isNotEmpty()) {
+                                    lastConnectedSSID = currentSSID
+                                    
+                                    // Save disconnection to history
+                                    handler.post {
+                                        saveWifiEvent(currentSSID, "Disconnected")
+                                    }
                                 }
+
+                                isManualDisconnectRequested = true
+
+                                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                                    wifiManager.disconnect()
+                                    startDisconnectMonitoring()
+                                    result.success(true)
+                                } else {
+                                    val intent = Intent(Settings.ACTION_WIFI_SETTINGS)
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(intent)
+                                    connectivityManager?.bindProcessToNetwork(null)
+
+                                    startDisconnectMonitoring()
+                                    result.success(false)
+                                }
+
+                                networkCallback?.let {
+                                    connectivityManager?.unregisterNetworkCallback(it)
+                                }
+                                networkCallback = null
+                            } catch (e: Exception) {
+                                Log.e("MainActivity", "Error during Wi-Fi disconnect: ${e.message}")
+                                isManualDisconnectRequested = false
+                                result.success(false)
                             }
                         }
 
+                        "openWifiSettings" -> {
+                            try {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    val intent = Intent(Settings.Panel.ACTION_WIFI)
+                                    startActivity(intent)
+                                } else {
+                                    val intent = Intent(Settings.ACTION_WIFI_SETTINGS)
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(intent)
+                                }
+                                result.success(true)
+                            } catch (e: Exception) {
+                                result.error("OPEN_WIFI_SETTINGS_FAILED", e.message, null)
+                            }
+                        }
 
-                        connectivityManager?.requestNetwork(request, networkCallback!!)
-                    } else {
-                        result.success(false)
+                        "getCurrentSSID" -> {
+                            try {
+                                val currentSSID = getCurrentSSID()
+                                if (currentSSID.isNotEmpty()) {
+                                    result.success(currentSSID)
+                                } else {
+                                    result.success(null)
+                                }
+                            } catch (e: Exception) {
+                                result.success(null)
+                            }
+                        }
+
+                        "getAndroidVersion" -> {
+                            result.success(Build.VERSION.SDK_INT)
+                        }
+
+                        else -> result.notImplemented()
                     }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error in method call: ${e.message}")
+                    result.error("RUNTIME_ERROR", "An error occurred: ${e.message}", null)
                 }
+            }
 
-                "disconnectWifi" -> {
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_HISTORY_CHANNEL)
+                .setMethodCallHandler { call, result ->
                     try {
-                        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-                        
-                        val currentSSID = getCurrentSSID()
-                        if (currentSSID.isNotEmpty()) {
-                            lastConnectedSSID = currentSSID
-                        }
-                        
-                        // Set the flag to indicate manual disconnection
-                        isManualDisconnectRequested = true
-                        
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                            wifiManager.disconnect()
-                            result.success(true)
+                        if (call.method == "getWifiHistory") {
+                            val prefs: SharedPreferences = getSharedPreferences("wifi_history", MODE_PRIVATE)
+                            val history = prefs.getString("history", "[]")
+                            result.success(history)
                         } else {
-                            val intent = Intent(Settings.ACTION_WIFI_SETTINGS)
-                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            startActivity(intent)
-                            connectivityManager?.bindProcessToNetwork(null)
-                            result.success(false)
-                        }
-                        
-                        networkCallback?.let {
-                            connectivityManager?.unregisterNetworkCallback(it)
-                        }
-                        networkCallback = null
-                    } catch (e: Exception) {
-                        Log.e("MainActivity", "Error during Wi-Fi disconnect: ${e.message}")
-                        isManualDisconnectRequested = false
-                        result.success(false)
-                    }
-                }
-
-                "openWifiSettings" -> {
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            val intent = Intent(Settings.Panel.ACTION_WIFI)
-                            startActivity(intent)
-                        } else {
-                            val intent = Intent(Settings.ACTION_WIFI_SETTINGS)
-                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            startActivity(intent)
-                        }
-                        result.success(true)
-                    } catch (e: Exception) {
-                        result.error("OPEN_WIFI_SETTINGS_FAILED", e.message, null)
-                    }
-                }
-
-                "getCurrentSSID" -> {
-                    try {
-                        val currentSSID = getCurrentSSID()
-                        if (currentSSID.isNotEmpty()) {
-                            result.success(currentSSID)
-                        } else {
-                            result.success(null)
+                            result.notImplemented()
                         }
                     } catch (e: Exception) {
-                        result.success(null)
+                        Log.e("MainActivity", "Error in history method call: ${e.message}")
+                        result.error("RUNTIME_ERROR", "An error occurred: ${e.message}", null)
                     }
                 }
 
-                "getAndroidVersion" -> {
-                    result.success(Build.VERSION.SDK_INT)
-                }
+            // Register receiver with delay to avoid startup issues
+            handler.postDelayed({
+                registerWifiReceiver()
+            }, 1000)
+            
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error configuring Flutter engine: ${e.message}")
+        }
+    }
 
-                else -> result.notImplemented()
+        private fun saveWifiEvent(ssid: String, status: String) {
+            try {
+                val prefs = getSharedPreferences("wifi_history", MODE_PRIVATE)
+                val historyJson = prefs.getString("history", "[]")
+                val historyArray = JSONArray(historyJson ?: "[]")
+                val now = System.currentTimeMillis()
+                
+                // Check for duplicates in the last minute
+                var isDuplicate = false
+                val oneMinuteAgo = now - 60000 // 60 seconds
+                
+                for (i in 0 until historyArray.length()) {
+                    val item = historyArray.getJSONObject(i)
+                    val itemSSID = item.getString("ssid")
+                    val itemStatus = item.getString("status")
+                    val itemTimestamp = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", java.util.Locale.getDefault())
+                        .parse(item.getString("timestamp"))?.time ?: 0L
+                        
+                    if (itemSSID == ssid && itemStatus == status && (now - itemTimestamp) < 60000) {
+                        isDuplicate = true
+                        break
+                    }
+                }
+                
+                if (!isDuplicate) {
+                    val timestamp = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", java.util.Locale.getDefault())
+                        .format(java.util.Date(now))
+
+                    val event = JSONObject().apply {
+                        put("ssid", ssid)
+                        put("status", status)
+                        put("timestamp", timestamp)
+                    }
+
+                    historyArray.put(event)
+
+                    val trimmedArray = JSONArray().apply {
+                        for (i in maxOf(0, historyArray.length() - 100) until historyArray.length()) {
+                            put(historyArray.get(i))
+                        }
+                    }
+
+                    prefs.edit().putString("history", trimmedArray.toString()).apply()
+                    Log.d("MainActivity", "Saved Wi-Fi event: $ssid - $status")
+                    
+                    // Also notify Flutter
+                    handler.post {
+                        if (status == "Connected") {
+                            wifiChannel?.invokeMethod("wifiConnected", ssid)
+                        } else {
+                            wifiChannel?.invokeMethod("wifiDisconnected", ssid)
+                        }
+                    }
+                } else {
+                    Log.d("MainActivity", "Skipped duplicate Wi-Fi event: $ssid - $status (within 60 seconds)")
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error saving Wi-Fi event: ${e.message}")
             }
         }
-
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_HISTORY_CHANNEL)
-            .setMethodCallHandler { call, result ->
-                if (call.method == "getWifiHistory") {
-                    val prefs: SharedPreferences = getSharedPreferences("wifi_history", MODE_PRIVATE)
-                    val history = prefs.getString("history", "[]")
-                    result.success(history)
-                } else {
-                    result.notImplemented()
-                }
-            }
-
-        registerWifiReceiver()
-    }
 
     private fun startDisconnectMonitoring() {
         disconnectCheckRunnable?.let { handler.removeCallbacks(it) }
@@ -251,25 +335,37 @@ class MainActivity : FlutterActivity() {
 
         disconnectCheckRunnable = object : Runnable {
             override fun run() {
-                val currentSSID = getCurrentSSID()
-                Log.d("DisconnectMonitor", "Check $checkCount: Current SSID = '$currentSSID', Last connected = '$lastConnectedSSID'")
+                try {
+                    val currentSSID = getCurrentSSID()
+                    Log.d("DisconnectMonitor", "Check $checkCount: Current SSID = '$currentSSID', Last connected = '$lastConnectedSSID'")
 
-                checkCount++
+                    checkCount++
 
-                if (isConnected && currentSSID.isEmpty() && !lastConnectedSSID.isNullOrEmpty()) {
-                    Log.d("DisconnectMonitor", "Disconnect detected! Triggering notification.")
-                    handleWifiDisconnection()
-                    isManualDisconnectRequested = false
-                    return
+                    if (isConnected && currentSSID.isEmpty() && !lastConnectedSSID.isNullOrEmpty()) {
+                        Log.d("DisconnectMonitor", "Disconnect detected! Triggering notification.")
+                        handleWifiDisconnection()
+                        isManualDisconnectRequested = false
+                        return
+                    } else if (!isConnected && currentSSID.isNotEmpty()) {
+                        // External connection detected
+                        Log.d("DisconnectMonitor", "External connection detected: $currentSSID")
+                        lastConnectedSSID = currentSSID
+                        isConnected = true
+                        
+                        // Save connection to history
+                        saveWifiEvent(currentSSID, "Connected")
+                    }
+
+                    if (checkCount >= maxChecks || (currentSSID.isNotEmpty() && currentSSID != lastConnectedSSID)) {
+                        Log.d("DisconnectMonitor", "Stopping disconnect monitoring")
+                        isManualDisconnectRequested = false
+                        return
+                    }
+
+                    handler.postDelayed(this, 2000)
+                } catch (e: Exception) {
+                    Log.e("DisconnectMonitor", "Error in monitor: ${e.message}")
                 }
-
-                if (checkCount >= maxChecks || (currentSSID.isNotEmpty() && currentSSID != lastConnectedSSID)) {
-                    Log.d("DisconnectMonitor", "Stopping disconnect monitoring")
-                    isManualDisconnectRequested = false
-                    return
-                }
-
-                handler.postDelayed(this, 2000)
             }
         }
 
@@ -286,110 +382,177 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // Inside MainActivity.kt - modify the handleWifiDisconnection() method
-            private fun handleWifiDisconnection() {
-                if (isConnected && !lastConnectedSSID.isNullOrEmpty()) {
-                    Log.d("WiFiDisconnect", "Handling disconnection for: $lastConnectedSSID")
+    private fun handleWifiDisconnection() {
+        if (isConnected && !lastConnectedSSID.isNullOrEmpty()) {
+            Log.d("WiFiDisconnect", "Handling disconnection for: $lastConnectedSSID")
 
-                    val serviceIntent = Intent(this, WifiForegroundService::class.java)
-                    serviceIntent.putExtra("ssid", lastConnectedSSID)
-                    serviceIntent.putExtra("status", "Disconnected")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(serviceIntent)
-                    }
-                    
-                    // Pass the disconnect type to Flutter
-                    wifiChannel?.invokeMethod("wifiDisconnected", 
-                        mapOf(
-                            "ssid" to lastConnectedSSID,
-                            "isManual" to isManualDisconnectRequested
-                        )
-                    )
-                    
-                    isConnected = false
-                    lastConnectedSSID = null
-                    isManualDisconnectRequested = false
-                }
+            val serviceIntent = Intent(this, WifiForegroundService::class.java)
+            serviceIntent.putExtra("ssid", lastConnectedSSID)
+            serviceIntent.putExtra("status", "Disconnected")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
             }
+            
+            // Save to history
+            saveWifiEvent(lastConnectedSSID!!, "Disconnected")
+
+            isConnected = false
+            lastConnectedSSID = null
+        }
+    }
 
     private fun registerWifiReceiver() {
-        val filter = IntentFilter()
-        filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
-        filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION)
+        try {
+            val filter = IntentFilter()
+            filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+            filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION)
 
-        wifiReceiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                when (intent?.action) {
-                    WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
-                        val networkInfo = intent.getParcelableExtra<NetworkInfo>(WifiManager.EXTRA_NETWORK_INFO)
-                        Log.d("WiFiReceiver", "Network state changed: ${networkInfo?.state}")
+            wifiReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    try {
+                        when (intent?.action) {
+                            WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
+                                val networkInfo = intent.getParcelableExtra<NetworkInfo>(WifiManager.EXTRA_NETWORK_INFO)
+                                Log.d("WiFiReceiver", "Network state changed: ${networkInfo?.state}")
 
-                        if (networkInfo != null && networkInfo.type == ConnectivityManager.TYPE_WIFI) {
-                            when (networkInfo.state) {
-                                NetworkInfo.State.CONNECTED -> {
-                                    val currentSSID = getCurrentSSID()
-                                    Log.d("WiFiReceiver", "Connected to: $currentSSID")
+                                if (networkInfo != null && networkInfo.type == ConnectivityManager.TYPE_WIFI) {
+                                    when (networkInfo.state) {
+                                        NetworkInfo.State.CONNECTED -> {
+                                            val currentSSID = getCurrentSSID()
+                                            Log.d("WiFiReceiver", "Connected to: $currentSSID")
 
-                                    if (currentSSID.isNotEmpty()) {
-                                        if (currentSSID != lastConnectedSSID || !isConnected) {
-                                            // Only update state, no history/notification here
-                                            lastConnectedSSID = currentSSID
-                                            isConnected = true
-                                            isManualDisconnectRequested = false
+                                            if (currentSSID.isNotEmpty()) {
+                                                if (currentSSID != lastConnectedSSID || !isConnected) {
+                                                    // Update state
+                                                    lastConnectedSSID = currentSSID
+                                                    isConnected = true
+                                                    isManualDisconnectRequested = false
+                                                    
+                                                    // Save to history
+                                                    handler.post {
+                                                        saveWifiEvent(currentSSID, "Connected")
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        NetworkInfo.State.DISCONNECTED, NetworkInfo.State.DISCONNECTING -> {
+                                            Log.d("WiFiReceiver", "Disconnected state detected")
+
+                                            if (isConnected && !lastConnectedSSID.isNullOrEmpty() && !isManualDisconnectRequested) {
+                                                Log.d("WiFiReceiver", "Handling automatic disconnect for: $lastConnectedSSID")
+                                                handler.post {
+                                                    handleWifiDisconnection()
+                                                }
+                                            }
+                                        }
+
+                                        else -> {
+                                            Log.d("WiFiReceiver", "Other network state: ${networkInfo.state}")
                                         }
                                     }
                                 }
-
-                                NetworkInfo.State.DISCONNECTED, NetworkInfo.State.DISCONNECTING -> {
-                                    Log.d("WiFiReceiver", "Disconnected state detected")
-
-                                    if (isConnected && !lastConnectedSSID.isNullOrEmpty() && !isManualDisconnectRequested) {
-                                        Log.d("WiFiReceiver", "Handling automatic disconnect for: $lastConnectedSSID")
-                                        handleWifiDisconnection()
-                                    }
-                                }
-
-                                else -> {
-                                    Log.d("WiFiReceiver", "Other network state: ${networkInfo.state}")
-                                }
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.e("WiFiReceiver", "Error in broadcast receiver: ${e.message}")
                     }
                 }
             }
-        }
 
-        registerReceiver(wifiReceiver, filter)
+            registerReceiver(wifiReceiver, filter)
+            Log.d("MainActivity", "WiFi receiver registered")
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error registering WiFi receiver: ${e.message}")
+        }
     }
-
-            override fun onLost(network: Network) {
-            super.onLost(network)
-            if (!isManualDisconnectRequested) {
-                handleWifiDisconnection()
-            }
-        }
 
     override fun onResume() {
         super.onResume()
-        if (isManualDisconnectRequested) {
+        try {
+            // Check for WiFi state changes
+            handler.postDelayed({
+                checkWifiStateChanged()
+            }, 500)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error in onResume: ${e.message}")
+        }
+    }
+    
+    private fun checkWifiStateChanged() {
+        try {
             val currentSSID = getCurrentSSID()
-            if (currentSSID.isEmpty() && isConnected) {
-                handleWifiDisconnection()
+            val prefs = getSharedPreferences("last_wifi_state", MODE_PRIVATE)
+            val lastSSID = prefs.getString("last_ssid", "")
+            val wasConnected = prefs.getBoolean("was_connected", false)
+            
+            if (currentSSID.isNotEmpty() && (currentSSID != lastSSID || !wasConnected)) {
+                // Connected to a new network while app was paused
+                Log.d("MainActivity", "Detected connection change on resume: $currentSSID")
+                lastConnectedSSID = currentSSID
+                isConnected = true
+                
+                // Save to history
+                saveWifiEvent(currentSSID, "Connected")
+            } else if (currentSSID.isEmpty() && wasConnected && !lastSSID.isNullOrEmpty()) {
+                // Disconnected while app was paused
+                Log.d("MainActivity", "Detected disconnection on resume from: $lastSSID")
+                
+                // Save to history
+                saveWifiEvent(lastSSID, "Disconnected")
             }
-            isManualDisconnectRequested = false
+            
+            // Update last known state
+            prefs.edit()
+                .putString("last_ssid", currentSSID)
+                .putBoolean("was_connected", currentSSID.isNotEmpty())
+                .apply()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error checking WiFi state changes: ${e.message}")
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try {
+            // Save current WiFi state
+            val currentSSID = getCurrentSSID()
+            getSharedPreferences("last_wifi_state", MODE_PRIVATE)
+                .edit()
+                .putString("last_ssid", currentSSID)
+                .putBoolean("was_connected", currentSSID.isNotEmpty())
+                .apply()
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error in onPause: ${e.message}")
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        wifiReceiver?.let { unregisterReceiver(it) }
+        try {
+            wifiReceiver?.let { 
+                try {
+                    unregisterReceiver(it) 
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error unregistering receiver: ${e.message}")
+                }
+            }
 
-        networkCallback?.let {
-            connectivityManager?.unregisterNetworkCallback(it)
+            networkCallback?.let {
+                try {
+                    connectivityManager?.unregisterNetworkCallback(it)
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error unregistering network callback: ${e.message}")
+                }
+            }
+
+            disconnectCheckRunnable?.let { handler.removeCallbacks(it) }
+            disconnectCheckRunnable = null
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error in onDestroy: ${e.message}")
         }
-
-        disconnectCheckRunnable?.let { handler.removeCallbacks(it) }
-        disconnectCheckRunnable = null
     }
 
     private fun isValidSSID(ssid: String?): Boolean {

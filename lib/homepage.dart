@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:developer';
 import 'dart:io';
+import 'dart:math' as Math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -92,67 +93,62 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
   }
 
   @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _connectionMonitor?.cancel(); // stop timer
-    super.dispose();
-  }
-
-  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      // Check current connection
       _checkCurrentConnection();
+
+      // // Always reload history when app is resumed
+      loadWifiHistory();
+      _loadWifiHistoryFromPrefs();
+
+      // // Check if WiFi state changed while app was in background
+      _checkForExternalWifiChanges();
     }
   }
 
-  // void _registerBreakReceiver() {
-  //   const reconnectBroadcast = "com.tabsquare.wifir.RECONNECT_DURATION";
-  //   final reconnectStream = EventChannel(reconnectBroadcast);
+  Future<void> _checkForExternalWifiChanges() async {
+    try {
+      final currentSSID = await WiFiForIoTPlugin.getSSID();
+      final isCurrentlyConnected =
+          currentSSID != null &&
+          currentSSID.isNotEmpty &&
+          currentSSID != "<unknown ssid>" &&
+          currentSSID != "0x";
 
-  //   reconnectStream.receiveBroadcastStream().listen(
-  //     (event) {
-  //       // Handle different event formats
-  //       int minutes = 0;
+      // Get the last known state
+      final prefs = await SharedPreferences.getInstance();
+      final lastKnownSSID = prefs.getString('last_known_ssid') ?? '';
+      final wasConnected = prefs.getBool('was_connected') ?? false;
 
-  //       if (event is int) {
-  //         // Direct integer value
-  //         minutes = event;
-  //       } else if (event is Map) {
-  //         // Map with 'duration' key
-  //         final durationRaw = event['duration'];
-  //         minutes = durationRaw is int
-  //             ? durationRaw
-  //             : int.tryParse(durationRaw.toString()) ?? 0;
-  //       } else if (event is String) {
-  //         // String representation of number
-  //         minutes = int.tryParse(event) ?? 0;
-  //       } else {
-  //         // Fallback - try to convert to string then parse
-  //         minutes = int.tryParse(event.toString()) ?? 0;
-  //       }
+      print(
+        "📱 App resumed: Current WiFi: $currentSSID, Last known: $lastKnownSSID",
+      );
 
-  //       String label = "Unknown Break";
+      // Check if state changed
+      if (isCurrentlyConnected &&
+          (lastKnownSSID != currentSSID || !wasConnected)) {
+        // Connected to a new network while app was in background
+        print("📡 Detected external connection to: $currentSSID");
+        _saveWifiHistory(currentSSID, "Connected");
+      } else if (!isCurrentlyConnected &&
+          wasConnected &&
+          lastKnownSSID.isNotEmpty) {
+        // Disconnected while app was in background
+        print("📡 Detected external disconnection from: $lastKnownSSID");
+        _saveWifiHistory(lastKnownSSID, "Disconnected");
+      }
 
-  //       if (minutes < 1) {
-  //         label = "Short Break ($minutes min)";
-  //       } else if (minutes < 30) {
-  //         label = "Tea Break ($minutes min)";
-  //       } else {
-  //         label = "Lunch Break ($minutes min)";
-  //       }
-
-  //       print("📡 $label");
-  //       if (mounted) {
-  //         ScaffoldMessenger.of(
-  //           context,
-  //         ).showSnackBar(SnackBar(content: Text("Break Detected: $label")));
-  //       }
-  //     },
-  //     onError: (error) {
-  //       print("❌ Error in break receiver: $error");
-  //     },
-  //   );
-  // }
+      // Update the last known state
+      await prefs.setString(
+        'last_known_ssid',
+        isCurrentlyConnected ? currentSSID : '',
+      );
+      await prefs.setBool('was_connected', isCurrentlyConnected);
+    } catch (e) {
+      print("❌ Error checking for external WiFi changes: $e");
+    }
+  }
 
   void _registerBreakReceiver() {
     const reconnectBroadcast = "com.tabsquare.wifir.RECONNECT_DURATION";
@@ -191,12 +187,6 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
           // ✅ NEW: show notification instead of only snackbar
           await _showBreakNotification(currentSSID!, label);
 
-          // if (mounted) {
-          //   ScaffoldMessenger.of(
-          //     context,
-          //   ).showSnackBar(SnackBar(content: Text("Break Detected: $label")));
-          // }
-
           _disconnectionTime = null;
         }
 
@@ -232,155 +222,120 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
     _connectionMonitor = Timer.periodic(const Duration(seconds: 5), (_) async {
       try {
         final ssid = await WiFiForIoTPlugin.getSSID();
+        final isCurrentlyConnected =
+            ssid != null &&
+            ssid.isNotEmpty &&
+            ssid != "<unknown ssid>" &&
+            ssid != "0x";
 
-        if (ssid == null ||
-            ssid.isEmpty ||
-            ssid == "<unknown ssid>" ||
-            ssid == "0x") {
-          // disconnected
-          if (connectedSSID != null) {
-            final prev = connectedSSID!;
-            print("⚠️ Lost connection to $prev (monitor)");
+        // Get the last known state
+        final prefs = await SharedPreferences.getInstance();
+        final lastKnownSSID = prefs.getString('last_known_ssid') ?? '';
+        final wasConnected = prefs.getBool('was_connected') ?? false;
 
-            // This is an automatic disconnect (not triggered by user)
-            //  _saveWifiHistory(prev, "Disconnected (Auto)");
-            setState(() => connectedSSID = null);
-            await _notifications.cancel(1);
-
-            // Navigate to history for automatic disconnect
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => HistoryPage(wifiHistoryList: wifiHistory),
-              ),
-            );
-          }
-        } else {
-          // connected
+        if (isCurrentlyConnected) {
+          // Currently connected to WiFi
           if (connectedSSID != ssid) {
-            print("✅ Auto-detected connection to $ssid");
-            setState(() => connectedSSID = ssid);
+            // New connection detected
+            print("✅ Connection monitor detected new connection to: $ssid");
+
+            // Update UI
+            if (mounted) {
+              setState(() => connectedSSID = ssid);
+            }
+
+            // Save to history if this is an external change
+            if (lastKnownSSID != ssid || !wasConnected) {
+              _saveWifiHistory(ssid, "Connected");
+            }
+
             await _scheduleReminderNotification(ssid);
           }
+        } else {
+          // Not connected to WiFi
+          if (connectedSSID != null) {
+            // Was connected before but not now - disconnection detected
+            final previousSSID = connectedSSID!;
+            print(
+              "⚠️ Connection monitor detected disconnection from: $previousSSID",
+            );
+
+            // Update UI
+            if (mounted) {
+              setState(() => connectedSSID = null);
+            }
+
+            // Save to history if this is an external change
+            if (wasConnected && lastKnownSSID.isNotEmpty) {
+              _saveWifiHistory(previousSSID, "Disconnected");
+            }
+
+            await _notifications.cancel(1);
+          }
         }
+
+        // Always update the last known state
+        await prefs.setString(
+          'last_known_ssid',
+          isCurrentlyConnected ? ssid : '',
+        );
+        await prefs.setBool('was_connected', isCurrentlyConnected);
       } catch (e) {
         print("❌ Monitor error: $e");
       }
     });
   }
 
-  // void _startConnectionMonitor() {
-  //   _connectionMonitor = Timer.periodic(const Duration(seconds: 5), (_) async {
-  //     try {
-  //       final ssid = await WiFiForIoTPlugin.getSSID();
-
-  //       if (ssid == null ||
-  //           ssid.isEmpty ||
-  //           ssid == "<unknown ssid>" ||
-  //           ssid == "0x") {
-  //         // means disconnected
-  //         if (connectedSSID != null) {
-  //           final prev = connectedSSID!;
-  //           print("⚠️ Lost connection to $prev (monitor)");
-  //           // ❌ don't save history here, native will handle it
-  //           setState(() => connectedSSID = null);
-  //           await _notifications.cancel(1);
-  //         }
-  //       } else {
-  //         // means connected
-  //         if (connectedSSID != ssid) {
-  //           print("✅ Auto-detected connection to $ssid");
-  //           // ❌ don't save history here, native will handle it
-  //           setState(() => connectedSSID = ssid);
-  //           await _scheduleReminderNotification(ssid);
-  //         }
-  //       }
-  //     } catch (e) {
-  //       print("❌ Monitor error: $e");
-  //     }
-  //   });
-  // }
-
-  // Future<dynamic> _handleNativeMethodCalls(MethodCall call) async {
-  //   if (call.method == "wifiConnected") {
-  //     final ssid = call.arguments as String;
-  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
-  //       print("📡 Auto Wi-Fi connected: $ssid");
-  //       _saveWifiHistory(ssid, "Connected (Auto)");
-  //       if (mounted) {
-  //         setState(() => connectedSSID = ssid);
-  //       }
-  //       await _showWifiNotification(ssid);
-  //       await _scheduleReminderNotification(ssid);
-  //     }
-  //   } else if (call.method == "wifiDisconnected") {
-  //     final ssid = call.arguments as String;
-  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
-  //       print("📡 Auto Wi-Fi disconnected: $ssid");
-  //       _saveWifiHistory(ssid, "Disconnected (Auto)");
-  //       if (mounted) {
-  //         setState(() => connectedSSID = null);
-  //       }
-  //       await _showDisconnectedNotification(ssid);
-  //       // Cancel any pending reminder notifications
-  //       await _notifications.cancel(1);
-  //     }
-  //   }
-  // }
-
   Future<dynamic> _handleNativeMethodCalls(MethodCall call) async {
     if (call.method == "wifiConnected") {
-      final ssid = call.arguments as String;
+      final ssid = call.arguments is Map
+          ? call.arguments['ssid']
+          : call.arguments as String;
+
       if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
         print("📡 Wi-Fi connected: $ssid");
-        _saveWifiHistory(ssid, "Connected"); // 🔄 keep it simple
+
+        // Use simple "Connected" status
+        _saveWifiHistory(ssid, "Connected");
+
         if (mounted) setState(() => connectedSSID = ssid);
         await _showWifiNotification(ssid);
         await _scheduleReminderNotification(ssid);
       }
     } else if (call.method == "wifiDisconnected") {
-      String ssid = "";
+      String ssid;
+
       if (call.arguments is Map) {
-        final args = call.arguments as Map<String, dynamic>;
-        ssid = args["ssid"] ?? "";
+        final args = call.arguments as Map<dynamic, dynamic>;
+        ssid = args["ssid"] as String;
       } else {
         ssid = call.arguments as String;
       }
 
       if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
         print("📡 Wi-Fi disconnected: $ssid");
-        _saveWifiHistory(ssid, "Disconnected"); // 🔄 simplified
-        if (mounted) setState(() => connectedSSID = null);
+
+        // Use simple "Disconnected" status
+        _saveWifiHistory(ssid, "Disconnected");
+
+        if (mounted) {
+          setState(() => connectedSSID = null);
+
+          // Navigate to history page
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => HistoryPage(wifiHistoryList: wifiHistory),
+              ),
+            );
+          });
+        }
+
         await _notifications.cancel(1);
       }
     }
   }
-
-  // Future<dynamic> _handleNativeMethodCalls(MethodCall call) async {
-  //   if (call.method == "wifiConnected") {
-  //     final ssid = call.arguments as String;
-  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
-  //       print("📡 Auto Wi-Fi connected: $ssid");
-  //       _saveWifiHistory(ssid, "Connected (Auto)");
-  //       if (mounted) {
-  //         setState(() => connectedSSID = ssid);
-  //       }
-  //       await _showWifiNotification(ssid);
-  //       await _scheduleReminderNotification(ssid);
-  //     }
-  //   } else if (call.method == "wifiDisconnected") {
-  //     final ssid = call.arguments as String;
-  //     if (ssid.isNotEmpty && ssid != "<unknown ssid>") {
-  //       print("📡 Wi-Fi disconnected: $ssid");
-  //       _saveWifiHistory(ssid, "Disconnected"); // Make sure this is called
-  //       if (mounted) {
-  //         setState(() => connectedSSID = null);
-  //       }
-  //       //await _showDisconnectedNotification(ssid);
-  //       await _notifications.cancel(1);
-  //     }
-  //   }
-  // }
 
   Future<void> _initializeNotifications() async {
     const AndroidInitializationSettings androidInit =
@@ -442,25 +397,6 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
       notifDetails,
     );
   }
-
-  // Future<void> _showDisconnectedNotification(String ssid) async {
-  //   const androidDetails = AndroidNotificationDetails(
-  //     'wifi_channel',
-  //     'Wi-Fi Notifications',
-  //     channelDescription: 'Notifies when Wi-Fi is disconnected',
-  //     importance: Importance.max,
-  //     priority: Priority.high,
-  //   );
-
-  //   const notifDetails = NotificationDetails(android: androidDetails);
-
-  //   await _notifications.show(
-  //     DateTime.now().millisecondsSinceEpoch ~/ 1000,
-  //     'Wi-Fi Disconnected',
-  //     'Logout from: $ssid',
-  //     notifDetails,
-  //   );
-  // }
 
   Future<void> _scheduleReminderNotification(String ssid) async {
     const androidDetails = AndroidNotificationDetails(
@@ -586,12 +522,18 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
   Future<void> loadWifiHistory() async {
     const platform = MethodChannel("wifi.history.channel");
     try {
+      // Get history from native code
       final String historyJson = await platform.invokeMethod("getWifiHistory");
+      print(
+        "📜 Raw WiFi History: ${historyJson.substring(0, Math.min(100, historyJson.length))}...",
+      );
+
       final List<dynamic> historyList = jsonDecode(
         historyJson.isNotEmpty ? historyJson : "[]",
       );
       print("📜 Loaded Wi-Fi History: ${historyList.length} records");
-      if (mounted) {
+
+      if (mounted && historyList.isNotEmpty) {
         setState(() {
           wifiHistory.clear();
           wifiHistory.addAll(
@@ -699,7 +641,8 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
         print("📡 Currently connected to: $ssid");
 
         if (wifiHistory.isEmpty || wifiHistory.last.ssid != ssid) {
-          _saveWifiHistory(ssid, "Connected"); // 🔄 simplified
+          // Use simple "Connected" status
+          _saveWifiHistory(ssid, "Connected");
         }
       } else {
         setState(() => connectedSSID = null);
@@ -734,26 +677,17 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
       if (canScan == CanStartScan.yes) {
         await WiFiScan.instance.startScan();
         final results = await WiFiScan.instance.getScannedResults();
-        // Only keep a specific SSID
-        const targetSSID = "TSIT 2.4G"; // change this
-        final filtered = results.where((ap) => ap.ssid == targetSSID).toList();
-
-        print("📡 Found Wi-Fi Networks: ${filtered.length}");
-        setState(() {
-          wifiList
-            ..clear()
-            ..addAll(filtered);
-        });
-        // if (mounted) {
-        //   final ordered = _prioritizeConnected(
-        //     List<WiFiAccessPoint>.from(results),
-        //   );
-        //   setState(() {
-        //     wifiList
-        //       ..clear()
-        //       ..addAll(ordered);
-        //   });
-        // }
+        print("📡 Found Wi-Fi Networks: ${results.length}");
+        if (mounted) {
+          final ordered = _prioritizeConnected(
+            List<WiFiAccessPoint>.from(results),
+          );
+          setState(() {
+            wifiList
+              ..clear()
+              ..addAll(ordered);
+          });
+        }
       } else {
         print("❌ Cannot start Wi-Fi scan, permissions issue!");
         Fluttertoast.showToast(
@@ -781,34 +715,41 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
   void _saveWifiHistory(String ssid, String status) {
     if (!mounted) return;
 
-    // ✅ Avoid duplicate save (within 2 seconds, same SSID + status)
-    if (wifiHistory.isNotEmpty) {
-      final last = wifiHistory.last;
-      if (last.ssid == ssid &&
-          last.status == status &&
-          DateTime.now().difference(last.timestamp).inSeconds < 2) {
-        print("⏭ Skipping duplicate history entry: $ssid - $status");
-        return;
+    // Standardize status for connection/disconnection
+    String standardStatus = status;
+    if (status.startsWith("Connected") || status.startsWith("Login")) {
+      standardStatus = "Connected";
+    } else if (status.startsWith("Disconnected") ||
+        status.startsWith("Logout")) {
+      standardStatus = "Disconnected";
+    }
+
+    // Check for recent duplicates (within 60 seconds)
+    final now = DateTime.now();
+    bool isDuplicate = false;
+
+    for (final entry in wifiHistory) {
+      if (entry.ssid == ssid &&
+          entry.status == standardStatus &&
+          now.difference(entry.timestamp).inSeconds < 60) {
+        isDuplicate = true;
+        print(
+          "⚠️ Skipping duplicate history entry: $ssid - $standardStatus (within 60 seconds)",
+        );
+        break;
       }
     }
 
-    setState(() {
-      wifiHistory.add(
-        WifiHistory(ssid: ssid, status: status, timestamp: DateTime.now()),
-      );
-    });
-    _persistWifiHistory();
+    if (!isDuplicate) {
+      print("📝 Adding history entry: $ssid - $standardStatus");
+      setState(() {
+        wifiHistory.add(
+          WifiHistory(ssid: ssid, status: standardStatus, timestamp: now),
+        );
+      });
+      _persistWifiHistory();
+    }
   }
-
-  // void _saveWifiHistory(String ssid, String status) {
-  //   if (!mounted) return;
-  //   setState(() {
-  //     wifiHistory.add(
-  //       WifiHistory(ssid: ssid, status: status, timestamp: DateTime.now()),
-  //     );
-  //   });
-  //   _persistWifiHistory();
-  // }
 
   Future<void> _persistWifiHistory() async {
     try {
@@ -876,17 +817,15 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
           isConnecting = false;
           connectingSSID = null;
         });
+
+        // Use simple "Connected" status
         _saveWifiHistory(ssid, "Connected");
+
         print("✅ Connected to $ssid");
         Fluttertoast.showToast(msg: "Connected to $ssid");
 
-        // Show local notification
         await _showWifiNotification(ssid);
-
-        // Place the reminder scheduling here
         await _scheduleReminderNotification(ssid);
-
-        // Automatically move the connected network to top
         _moveConnectedToTop();
       } else {
         setState(() {
@@ -913,20 +852,27 @@ class _HomepageState extends State<Homepage> with WidgetsBindingObserver {
     try {
       final previousSSID = connectedSSID ?? "Unknown Wi-Fi";
       final bool result = await platform.invokeMethod("disconnectWifi");
+
       if (result) {
+        // Always use consistent "Disconnected" status
+        _saveWifiHistory(previousSSID, "Disconnected");
         if (mounted) setState(() => connectedSSID = null);
+
         print("🔌 Disconnected from $previousSSID");
         Fluttertoast.showToast(msg: "Disconnected from $previousSSID");
+
         await _notifications.cancel(1);
         _moveConnectedToTop();
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => HistoryPage(wifiHistoryList: wifiHistory),
-          ),
+      } else {
+        // Android 10+ fallback
+        Fluttertoast.showToast(
+          msg: "Please manually disconnect from Wi-Fi in settings",
         );
-        // no need to explicitly save "Disconnected (Manual)"
-        // native will already send wifiDisconnected → "Disconnected"
+        print("⚠️ Manual disconnect required for $previousSSID (Android 10+)");
+
+        // Same consistent status here
+        _saveWifiHistory(previousSSID, "Disconnected");
+        if (mounted) setState(() => connectedSSID = null);
       }
     } on PlatformException catch (e) {
       print("❌ Failed to disconnect Wi-Fi: ${e.message}");
